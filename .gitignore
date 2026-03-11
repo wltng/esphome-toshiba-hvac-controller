@@ -1,1 +1,6 @@
- .vscode
+.vscode
+venv
+__pycache__/
+esphome/.esphome/
+esphome/test_build.yaml
+esphome/test_build_v3.yaml

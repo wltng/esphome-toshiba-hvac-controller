@@ -4,15 +4,17 @@
  *
  */
 #include <cmath>
-#include <queue>
+#include <deque>
 
-#include "esphome.h"
 #include "esphome/components/climate/climate.h"
 #include "esphome/components/select/select.h"
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/switch/switch.h"
 #include "esphome/components/uart/uart.h"
+#include "esphome/core/application.h"
 #include "esphome/core/component.h"
+#include "esphome/core/helpers.h"
+#include "esphome/core/log.h"
 
 static const char* const TAG = "toshiba-controller";
 
@@ -20,23 +22,28 @@ static const char* const TAG = "toshiba-controller";
 #define MIN_TEMP_SETPOINT_COOLING 17
 #define MAX_TEMP_SETPOINT 30
 
+namespace esphome {
+
 struct ConfigSettings {
     double smart_thermostat_multiplier = 4.0;
     bool smart_thermostat_runaway_protection = false;
     bool disable_cooling_modes = false;
 };
 
-namespace esphome {
+enum CustomSwitchType { SWITCH_INTERNAL_THERMISTOR = 0, SWITCH_IONIZER = 1 };
 
 class ToshibaController;
 
 // Custom switch. Notifies the controller when state changes in HA.
 class CustomSwitch final : public switch_::Switch {
-    ToshibaController* controller_;
+    ToshibaController* controller_{nullptr};
+    CustomSwitchType type_{SWITCH_INTERNAL_THERMISTOR};
 
 public:
-    explicit CustomSwitch(ToshibaController* controller) : controller_(controller) {
-    }
+    CustomSwitch() = default;
+
+    void set_controller(ToshibaController* c) { controller_ = c; }
+    void set_type(CustomSwitchType t) { type_ = t; }
 
     void write_state(bool state) override;
 
@@ -48,8 +55,8 @@ public:
     }
 };
 
-const std::string CUSTOM_FAN_MODE_LOW_MEDIUM = "Low Medium";
-const std::string CUSTOM_FAN_MODE_MEDIUM_HIGH = "Medium High";
+static constexpr const char* CUSTOM_FAN_MODE_LOW_MEDIUM = "low medium";
+static constexpr const char* CUSTOM_FAN_MODE_MEDIUM_HIGH = "medium high";
 
 enum ToshibaSwingMode {
     SWING_MODE_OFF = 0x31,
@@ -74,6 +81,8 @@ enum ToshibaCommand {
     ROOM_TEMPERATURE = 0xBB,
     OUTDOOR_TEMPERATURE = 0xBE,
     IONIZER = 0xC7,
+    WIFILED1 = 0xDE,  // variant 1: on=0x05, off=0x00
+    WIFILED2 = 0xDF,  // variant 2: on=0x00, off=0x80
     SPECIAL_MODE = 0xF7,
     IDU_STATUS = 0xE4,
     ODU_STATUS = 0xE5,
@@ -143,18 +152,20 @@ static const std::vector<std::vector<uint8_t>> IDU_POST_HANDSHAKE = {
 class ToshibaController final : public climate::Climate, public Component {
     climate::ClimateTraits supported_traits_;
 
-    esphome::uart::UARTComponent* serial_;
-    esphome::sensor::Sensor* temperature_sensor_;
-    esphome::template_::TemplateSelect* swing_mode_select_;
-    esphome::template_::TemplateSelect* special_mode_select_;
-    esphome::template_::TemplateSelect* power_selection_select_;
+    esphome::uart::UARTComponent* serial_{nullptr};
+    esphome::sensor::Sensor* temperature_sensor_{nullptr};
+    esphome::select::Select* swing_mode_select_{nullptr};
+    esphome::select::Select* special_mode_select_{nullptr};
+    esphome::select::Select* silent_mode_select_{nullptr};
+    esphome::select::Select* fireplace_select_{nullptr};
+    esphome::select::Select* power_selection_select_{nullptr};
 
     uint32_t last_partial_register_request_millis_ = 0;
     uint32_t last_full_register_request_millis_ = 0;
     uint32_t last_external_temperature_sensor_control_millis_ = 0;
 
-    CustomSwitch switch_internal_thermistor_;
-    CustomSwitch switch_ionizer_;
+    CustomSwitch* switch_internal_thermistor_{nullptr};
+    CustomSwitch* switch_ionizer_{nullptr};
 
     uint8_t recv_buf_[256] = {};
     uint32_t recv_buf_len_ = 0;
@@ -164,6 +175,8 @@ class ToshibaController final : public climate::Climate, public Component {
     uint32_t last_sent_millis_ = 0;
 
     ConfigSettings config_settings_;
+
+    bool updating_from_ac_ = false;  // suppress on_value callbacks during AC-initiated state updates
 
     ToshibaState internal_power_state_ = ToshibaState::STATE_OFF;
     ToshibaFanMode internal_fan_mode_ = ToshibaFanMode::FAN_MEDIUM;
@@ -176,17 +189,17 @@ class ToshibaController final : public climate::Climate, public Component {
 
     int8_t internal_idu_room_temperature_ = 0;
 
-    sensor::Sensor sensor_outdoor_temperature_;
-    sensor::Sensor sensor_cdu_td_temp_;
-    sensor::Sensor sensor_cdu_ts_temp_;
-    sensor::Sensor sensor_cdu_te_temp_;
-    sensor::Sensor sensor_cdu_load_;
-    sensor::Sensor sensor_cdu_iac_;
-    sensor::Sensor sensor_fcu_air_temp_;
-    sensor::Sensor sensor_fcu_setpoint_temp_;
-    sensor::Sensor sensor_fcu_tc_temp_;
-    sensor::Sensor sensor_fcu_tcj_temp_;
-    sensor::Sensor sensor_fcu_fan_rpm_;
+    sensor::Sensor* sensor_outdoor_temperature_{nullptr};
+    sensor::Sensor* sensor_cdu_td_temp_{nullptr};
+    sensor::Sensor* sensor_cdu_ts_temp_{nullptr};
+    sensor::Sensor* sensor_cdu_te_temp_{nullptr};
+    sensor::Sensor* sensor_cdu_load_{nullptr};
+    sensor::Sensor* sensor_cdu_iac_{nullptr};
+    sensor::Sensor* sensor_fcu_air_temp_{nullptr};
+    sensor::Sensor* sensor_fcu_setpoint_temp_{nullptr};
+    sensor::Sensor* sensor_fcu_tc_temp_{nullptr};
+    sensor::Sensor* sensor_fcu_tcj_temp_{nullptr};
+    sensor::Sensor* sensor_fcu_fan_rpm_{nullptr};
 
     uint64_t loop_cnt_ = 0;
 
@@ -199,11 +212,11 @@ class ToshibaController final : public climate::Climate, public Component {
     }
 
     void process_uart_tx() {
-        if (millis() - last_sent_millis_ < 100) {
+        if (millis() - last_sent_millis_ < 50) {
             return;
         }
 
-        if (recv_buf_len_ > 0 || millis() - last_recv_millis_ < 100) {
+        if (recv_buf_len_ > 0 || millis() - last_recv_millis_ < 50) {
             return;
         }
 
@@ -303,10 +316,11 @@ class ToshibaController final : public climate::Climate, public Component {
         } else {
             this->internal_target_temperature_ = value;
         }
-        sensor_fcu_setpoint_temp_.publish_state(this->internal_target_temperature_);
+        if (sensor_fcu_setpoint_temp_) sensor_fcu_setpoint_temp_->publish_state(this->internal_target_temperature_);
 
-        if (this->switch_internal_thermistor_.state || (old_internal_target_temperature!=this->internal_target_temperature_)) {  
-            // only update the climate target temperature if IDU operates on a different temperature (external change through IR) or if the internal temperature sensor is used
+        if (switch_internal_thermistor_ && switch_internal_thermistor_->state) {
+            // only sync target_temperature from AC when using internal thermistor
+            // with external sensor, target_temperature is the user's setpoint and must not be overwritten by smart thermostat adjustments
             this->target_temperature = this->internal_target_temperature_;
             this->publish_state();
         }
@@ -419,6 +433,18 @@ class ToshibaController final : public climate::Climate, public Component {
     }
 
     void handle_register_special_mode(ToshibaSpecialModes value) {
+        updating_from_ac_ = true;
+        // Reset all selects to their neutral value first, then set the active one
+        bool is_silent = (value == ToshibaSpecialModes::SPECIAL_MODE_SILENT_1 ||
+                          value == ToshibaSpecialModes::SPECIAL_MODE_SILENT_2);
+        bool is_fireplace = (value == ToshibaSpecialModes::SPECIAL_MODE_FIREPLACE_1 ||
+                             value == ToshibaSpecialModes::SPECIAL_MODE_FIREPLACE_2);
+
+        if (!is_silent && silent_mode_select_)
+            silent_mode_select_->publish_state("Off");
+        if (!is_fireplace && fireplace_select_)
+            fireplace_select_->publish_state("Off");
+
         switch (value) {
             case ToshibaSpecialModes::SPECIAL_MODE_STANDARD:
                 ESP_LOGI(TAG, "[REGISTER] received special mode: %s", "STANDARD");
@@ -436,22 +462,6 @@ class ToshibaController final : public climate::Climate, public Component {
                 ESP_LOGI(TAG, "[REGISTER] received special mode: %s", "EIGHT_DEGREES");
                 this->special_mode_select_->publish_state("8 Degrees");
                 break;
-            case ToshibaSpecialModes::SPECIAL_MODE_FIREPLACE_1:
-                ESP_LOGI(TAG, "[REGISTER] received special mode: %s", "FIREPLACE_1");
-                this->special_mode_select_->publish_state("Fireplace 1");
-                break;
-            case ToshibaSpecialModes::SPECIAL_MODE_FIREPLACE_2:
-                ESP_LOGI(TAG, "[REGISTER] received special mode: %s", "FIREPLACE_2");
-                this->special_mode_select_->publish_state("Fireplace 2");
-                break;
-            case ToshibaSpecialModes::SPECIAL_MODE_SILENT_1:
-                ESP_LOGI(TAG, "[REGISTER] received special mode: %s", "SILENT_1");
-                this->special_mode_select_->publish_state("Silent 1");
-                break;
-            case ToshibaSpecialModes::SPECIAL_MODE_SILENT_2:
-                ESP_LOGI(TAG, "[REGISTER] received special mode: %s", "SILENT_2");
-                this->special_mode_select_->publish_state("Silent 2");
-                break;
             case ToshibaSpecialModes::SPECIAL_MODE_SLEEP_CARE:
                 ESP_LOGI(TAG, "[REGISTER] received special mode: %s", "SLEEP_CARE");
                 this->special_mode_select_->publish_state("Sleep Care");
@@ -464,23 +474,44 @@ class ToshibaController final : public climate::Climate, public Component {
                 ESP_LOGI(TAG, "[REGISTER] received special mode: %s", "COMFORT");
                 this->special_mode_select_->publish_state("Comfort");
                 break;
+            case ToshibaSpecialModes::SPECIAL_MODE_SILENT_1:
+                ESP_LOGI(TAG, "[REGISTER] received special mode: %s", "SILENT_1");
+                this->special_mode_select_->publish_state("Standard");
+                if (silent_mode_select_) silent_mode_select_->publish_state("Silent 1");
+                break;
+            case ToshibaSpecialModes::SPECIAL_MODE_SILENT_2:
+                ESP_LOGI(TAG, "[REGISTER] received special mode: %s", "SILENT_2");
+                this->special_mode_select_->publish_state("Standard");
+                if (silent_mode_select_) silent_mode_select_->publish_state("Silent 2");
+                break;
+            case ToshibaSpecialModes::SPECIAL_MODE_FIREPLACE_1:
+                ESP_LOGI(TAG, "[REGISTER] received special mode: %s", "FIREPLACE_1");
+                this->special_mode_select_->publish_state("Standard");
+                if (fireplace_select_) fireplace_select_->publish_state("Fireplace 1");
+                break;
+            case ToshibaSpecialModes::SPECIAL_MODE_FIREPLACE_2:
+                ESP_LOGI(TAG, "[REGISTER] received special mode: %s", "FIREPLACE_2");
+                this->special_mode_select_->publish_state("Standard");
+                if (fireplace_select_) fireplace_select_->publish_state("Fireplace 2");
+                break;
             default:
                 ESP_LOGE(TAG, "[REGISTER] received unknown special mode: %s",
                          format_hex_pretty((uint8_t)value).c_str());
                 break;
         }
         this->internal_special_mode_ = value;
+        updating_from_ac_ = false;
     }
 
     void handle_register_ionizer(ToshibaIonizer value) {
         switch (value) {
             case ToshibaIonizer::IONIZER_ON:
                 ESP_LOGI(TAG, "[REGISTER] received ionizer state: %s", "ON");
-                switch_ionizer_.publish_state(true);
+                if (switch_ionizer_) switch_ionizer_->publish_state(true);
                 break;
             case ToshibaIonizer::IONIZER_OFF:
                 ESP_LOGI(TAG, "[REGISTER] received ionizer state: %s", "OFF");
-                switch_ionizer_.publish_state(false);
+                if (switch_ionizer_) switch_ionizer_->publish_state(false);
                 break;
             default:
                 ESP_LOGE(TAG, "[REGISTER] received unknown ionizer state: %s",
@@ -514,20 +545,28 @@ class ToshibaController final : public climate::Climate, public Component {
     void handle_register_room_temperature(uint8_t value) {
         ESP_LOGI(TAG, "[REGISTER] received room temperature: %d", value);
         this->internal_idu_room_temperature_ = value;
-        sensor_fcu_air_temp_.publish_state(value);
+        if (sensor_fcu_air_temp_) sensor_fcu_air_temp_->publish_state(value);
 
-        if (this->switch_internal_thermistor_.state) {
+        if (switch_internal_thermistor_ && switch_internal_thermistor_->state) {
             this->current_temperature = (float)value;
             this->publish_state();
         }
     }
 
     void handle_register_outdoor_temperature(int8_t value) {
+        if (value == 127) {
+            ESP_LOGD(TAG, "[REGISTER] outdoor temperature unavailable (127), skipping");
+            return;
+        }
         ESP_LOGI(TAG, "[REGISTER] received outdoor temperature: %d", value);
-        this->sensor_outdoor_temperature_.publish_state(value);
+        if (sensor_outdoor_temperature_) sensor_outdoor_temperature_->publish_state(value);
     }
 
     void handle_message() {
+        if (recv_buf_len_ < 4) {
+            ESP_LOGD(TAG, "handle message too short (%d)", recv_buf_len_);
+            return;
+        }
         if (recv_buf_len_ > 30) {
             ESP_LOGD(TAG, "handle message too long (%d)", recv_buf_len_);
             return;
@@ -604,51 +643,49 @@ class ToshibaController final : public climate::Climate, public Component {
             }
         } else if (recv_buf_len_ == 22) {
             if (recv_buf_[12] == ToshibaCommand::ODU_STATUS) {
-                sensor_cdu_td_temp_.publish_state(static_cast<int8_t>(recv_buf_[13]));
-                sensor_cdu_ts_temp_.publish_state(static_cast<int8_t>(recv_buf_[14]));
-                sensor_cdu_te_temp_.publish_state(static_cast<int8_t>(recv_buf_[15]));
-                sensor_cdu_load_.publish_state(static_cast<float_t>(recv_buf_[16]) /
-                                               1.7f);  // toshiba names this register "cduHz", however it ranges from
-                                                       // 0-170 for different ODUs and is outside of the comp. range
-                sensor_cdu_iac_.publish_state(static_cast<uint8_t>(
-                    recv_buf_[19]));  // unsure, ranges from 0-68 and could be EEV actuation for this IDU
-                ESP_LOGI(
-                    TAG,
+                if (sensor_cdu_td_temp_) sensor_cdu_td_temp_->publish_state(static_cast<int8_t>(recv_buf_[13]));
+                if (sensor_cdu_ts_temp_) sensor_cdu_ts_temp_->publish_state(static_cast<int8_t>(recv_buf_[14]));
+                if (sensor_cdu_te_temp_) sensor_cdu_te_temp_->publish_state(static_cast<int8_t>(recv_buf_[15]));
+                if (sensor_cdu_load_) sensor_cdu_load_->publish_state(static_cast<float_t>(recv_buf_[16]) / 1.7f);
+                if (sensor_cdu_iac_) sensor_cdu_iac_->publish_state(static_cast<uint8_t>(recv_buf_[19]));
+                ESP_LOGI(TAG,
                     "[REGISTERS_ODU] STATUS: cduTdTemp = %d, cduTsTemp = %d, cduTeTemp = %d, cduLoad = %d, cduIac = %d",
-                    (int32_t)sensor_cdu_td_temp_.get_state(), (int32_t)sensor_cdu_ts_temp_.get_state(),
-                    (int32_t)sensor_cdu_te_temp_.get_state(), (int32_t)sensor_cdu_load_.get_state(),
-                    (int32_t)sensor_cdu_iac_.get_state());
+                    sensor_cdu_td_temp_ ? (int32_t)sensor_cdu_td_temp_->state : -999,
+                    sensor_cdu_ts_temp_ ? (int32_t)sensor_cdu_ts_temp_->state : -999,
+                    sensor_cdu_te_temp_ ? (int32_t)sensor_cdu_te_temp_->state : -999,
+                    sensor_cdu_load_ ? (int32_t)sensor_cdu_load_->state : -999,
+                    sensor_cdu_iac_ ? (int32_t)sensor_cdu_iac_->state : -999);
             } else if (recv_buf_[12] == ToshibaCommand::IDU_STATUS) {
-                sensor_fcu_tc_temp_.publish_state(static_cast<int8_t>(recv_buf_[13]));
-                sensor_fcu_tcj_temp_.publish_state(static_cast<int8_t>(recv_buf_[14]));
-                sensor_fcu_fan_rpm_.publish_state(static_cast<uint8_t>(recv_buf_[15]));
+                if (sensor_fcu_tc_temp_) sensor_fcu_tc_temp_->publish_state(static_cast<int8_t>(recv_buf_[13]));
+                if (sensor_fcu_tcj_temp_) sensor_fcu_tcj_temp_->publish_state(static_cast<int8_t>(recv_buf_[14]));
+                if (sensor_fcu_fan_rpm_) sensor_fcu_fan_rpm_->publish_state(static_cast<uint8_t>(recv_buf_[15]));
                 ESP_LOGI(TAG, "[REGISTERS_IDU] STATUS: fcuTcTemp = %d, fcuTcjTemp = %d, fcuFanRpm = %d",
-                         (int32_t)sensor_fcu_tc_temp_.get_state(), (int32_t)sensor_fcu_tcj_temp_.get_state(),
-                         (int32_t)sensor_fcu_fan_rpm_.get_state());
+                         sensor_fcu_tc_temp_ ? (int32_t)sensor_fcu_tc_temp_->state : -999,
+                         sensor_fcu_tcj_temp_ ? (int32_t)sensor_fcu_tcj_temp_->state : -999,
+                         sensor_fcu_fan_rpm_ ? (int32_t)sensor_fcu_fan_rpm_->state : -999);
             }
         } else if (recv_buf_len_ == 24) {
             if (recv_buf_[14] == ToshibaCommand::ODU_STATUS) {
-                sensor_cdu_td_temp_.publish_state(static_cast<int8_t>(recv_buf_[15]));
-                sensor_cdu_ts_temp_.publish_state(static_cast<int8_t>(recv_buf_[16]));
-                sensor_cdu_te_temp_.publish_state(static_cast<int8_t>(recv_buf_[17]));
-                sensor_cdu_load_.publish_state(static_cast<float_t>(recv_buf_[18]) /
-                                               1.7f);  // toshiba names this register "cduHz", however it ranges from
-                                                       // 0-170 for different ODUs and is outside of the comp. range
-                sensor_cdu_iac_.publish_state(static_cast<uint8_t>(
-                    recv_buf_[21]));  // unsure, ranges from 0-68 and could be EEV actuation for this IDU
+                if (sensor_cdu_td_temp_) sensor_cdu_td_temp_->publish_state(static_cast<int8_t>(recv_buf_[15]));
+                if (sensor_cdu_ts_temp_) sensor_cdu_ts_temp_->publish_state(static_cast<int8_t>(recv_buf_[16]));
+                if (sensor_cdu_te_temp_) sensor_cdu_te_temp_->publish_state(static_cast<int8_t>(recv_buf_[17]));
+                if (sensor_cdu_load_) sensor_cdu_load_->publish_state(static_cast<float_t>(recv_buf_[18]) / 1.7f);
+                if (sensor_cdu_iac_) sensor_cdu_iac_->publish_state(static_cast<uint8_t>(recv_buf_[21]));
                 ESP_LOGI(TAG,
-                         "[REGISTERS_ODU_REQ] STATUS: cduTdTemp = %d, cduTsTemp = %d, cduTeTemp = %d, cduLoad = %d, "
-                         "cduIac = %d",
-                         (int32_t)sensor_cdu_td_temp_.get_state(), (int32_t)sensor_cdu_ts_temp_.get_state(),
-                         (int32_t)sensor_cdu_te_temp_.get_state(), (int32_t)sensor_cdu_load_.get_state(),
-                         (int32_t)sensor_cdu_iac_.get_state());
+                         "[REGISTERS_ODU_REQ] STATUS: cduTdTemp = %d, cduTsTemp = %d, cduTeTemp = %d, cduLoad = %d, cduIac = %d",
+                         sensor_cdu_td_temp_ ? (int32_t)sensor_cdu_td_temp_->state : -999,
+                         sensor_cdu_ts_temp_ ? (int32_t)sensor_cdu_ts_temp_->state : -999,
+                         sensor_cdu_te_temp_ ? (int32_t)sensor_cdu_te_temp_->state : -999,
+                         sensor_cdu_load_ ? (int32_t)sensor_cdu_load_->state : -999,
+                         sensor_cdu_iac_ ? (int32_t)sensor_cdu_iac_->state : -999);
             } else if (recv_buf_[14] == ToshibaCommand::IDU_STATUS) {
-                sensor_fcu_tc_temp_.publish_state(static_cast<int8_t>(recv_buf_[15]));
-                sensor_fcu_tcj_temp_.publish_state(static_cast<int8_t>(recv_buf_[16]));
-                sensor_fcu_fan_rpm_.publish_state(static_cast<uint8_t>(recv_buf_[17]));
+                if (sensor_fcu_tc_temp_) sensor_fcu_tc_temp_->publish_state(static_cast<int8_t>(recv_buf_[15]));
+                if (sensor_fcu_tcj_temp_) sensor_fcu_tcj_temp_->publish_state(static_cast<int8_t>(recv_buf_[16]));
+                if (sensor_fcu_fan_rpm_) sensor_fcu_fan_rpm_->publish_state(static_cast<uint8_t>(recv_buf_[17]));
                 ESP_LOGI(TAG, "[REGISTERS_IDU_REQ] STATUS: fcuTcTemp = %d, fcuTcjTemp = %d, fcuFanRpm = %d",
-                         (int32_t)sensor_fcu_tc_temp_.get_state(), (int32_t)sensor_fcu_tcj_temp_.get_state(),
-                         (int32_t)sensor_fcu_fan_rpm_.get_state());
+                         sensor_fcu_tc_temp_ ? (int32_t)sensor_fcu_tc_temp_->state : -999,
+                         sensor_fcu_tcj_temp_ ? (int32_t)sensor_fcu_tcj_temp_->state : -999,
+                         sensor_fcu_fan_rpm_ ? (int32_t)sensor_fcu_fan_rpm_->state : -999);
             }
         } else {
             ESP_LOGV(TAG, "Received unknown message with length: %d and value %s", recv_buf_len_,
@@ -679,7 +716,7 @@ class ToshibaController final : public climate::Climate, public Component {
             cnt++;
         }
 
-        if (recv_buf_len_ > 0 && millis() - last_recv_millis_ >= 200) {
+        if (recv_buf_len_ > 0 && millis() - last_recv_millis_ >= 100) {
             ESP_LOGE(TAG, "discarded %d rx bytes due to timeout", recv_buf_len_);
             recv_buf_len_ = 0;
         }
@@ -736,8 +773,7 @@ class ToshibaController final : public climate::Climate, public Component {
         supported_traits_.add_supported_fan_mode(climate::CLIMATE_FAN_MEDIUM);
         supported_traits_.add_supported_fan_mode(climate::CLIMATE_FAN_HIGH);
 
-        supported_traits_.add_supported_custom_fan_mode(CUSTOM_FAN_MODE_LOW_MEDIUM);
-        supported_traits_.add_supported_custom_fan_mode(CUSTOM_FAN_MODE_MEDIUM_HIGH);
+        supported_traits_.set_supported_custom_fan_modes({CUSTOM_FAN_MODE_LOW_MEDIUM, CUSTOM_FAN_MODE_MEDIUM_HIGH});
 
         supported_traits_.set_supports_current_temperature(true);
         supported_traits_.set_supports_two_point_target_temperature(false);
@@ -745,7 +781,7 @@ class ToshibaController final : public climate::Climate, public Component {
         supported_traits_.set_visual_min_temperature(
             (int)std::min(MIN_TEMP_SETPOINT_HEATING, MIN_TEMP_SETPOINT_COOLING));
         supported_traits_.set_visual_max_temperature(MAX_TEMP_SETPOINT);
-        supported_traits_.set_visual_current_temperature_step(0.5);
+        supported_traits_.set_visual_current_temperature_step(0.1);
         supported_traits_.set_visual_target_temperature_step(0.5);
     }
 
@@ -761,13 +797,17 @@ class ToshibaController final : public climate::Climate, public Component {
                          "Special mode EIGHT_DEGREES is only required for 5°C-16°C heating, switching to STANDARD");
                 this->internal_special_mode_ = ToshibaSpecialModes::SPECIAL_MODE_STANDARD;
                 request_write_register_(ToshibaCommand::SPECIAL_MODE, this->internal_special_mode_);
+                updating_from_ac_ = true;
                 this->special_mode_select_->publish_state("Standard");
+                updating_from_ac_ = false;
             } else if (this->internal_special_mode_ != ToshibaSpecialModes::SPECIAL_MODE_EIGHT_DEGREES &&
                        target_temperature < 17) {
                 ESP_LOGE(TAG, "Special mode EIGHT_DEGREES is required for 5°C-16°C heating, enabling");
                 this->internal_special_mode_ = ToshibaSpecialModes::SPECIAL_MODE_EIGHT_DEGREES;
                 request_write_register_(ToshibaCommand::SPECIAL_MODE, this->internal_special_mode_);
+                updating_from_ac_ = true;
                 this->special_mode_select_->publish_state("8 Degrees");
+                updating_from_ac_ = false;
             }
 
         } else {
@@ -775,24 +815,41 @@ class ToshibaController final : public climate::Climate, public Component {
                 ESP_LOGE(TAG, "Special mode EIGHT_DEGREES is only available in heating mode, switching to STANDARD");
                 this->internal_special_mode_ = ToshibaSpecialModes::SPECIAL_MODE_STANDARD;
                 request_write_register_(ToshibaCommand::SPECIAL_MODE, this->internal_special_mode_);
+                updating_from_ac_ = true;
                 this->special_mode_select_->publish_state("Standard");
+                updating_from_ac_ = false;
             }
         }
     }
 
 public:
-    ToshibaController(esphome::uart::UARTComponent* serial, esphome::sensor::Sensor* temperature_sensor,
-                      esphome::template_::TemplateSelect* special_mode_select,
-                      esphome::template_::TemplateSelect* swing_mode_select,
-                      esphome::template_::TemplateSelect* power_selection_select)
-        : serial_(serial),
-          temperature_sensor_(temperature_sensor),
-          special_mode_select_(special_mode_select),
-          swing_mode_select_(swing_mode_select),
-          power_selection_select_(power_selection_select),
-          switch_internal_thermistor_(this),
-          switch_ionizer_(this) {
+    ToshibaController() {
         configure_capabilities();
+    }
+
+    // Setters for dependency injection from ESPHome codegen
+    void set_uart(esphome::uart::UARTComponent* serial) { serial_ = serial; }
+    void set_temperature_sensor(esphome::sensor::Sensor* sensor) { temperature_sensor_ = sensor; }
+    void set_special_mode_select(esphome::select::Select* sel) { special_mode_select_ = sel; }
+    void set_swing_mode_select(esphome::select::Select* sel) { swing_mode_select_ = sel; }
+    void set_power_select(esphome::select::Select* sel) { power_selection_select_ = sel; }
+    void set_smart_thermostat_multiplier(float val) { config_settings_.smart_thermostat_multiplier = val; }
+    void set_disable_cooling_modes(bool val) {
+        config_settings_.disable_cooling_modes = val;
+        configure_capabilities();
+    }
+    void set_smart_thermostat_runaway_protection(bool val) { config_settings_.smart_thermostat_runaway_protection = val; }
+
+    // Switch setters for codegen (pointer-based wiring from switch.py)
+    void set_internal_thermistor_switch_obj(CustomSwitch* sw) {
+        switch_internal_thermistor_ = sw;
+        sw->set_controller(this);
+        sw->set_type(SWITCH_INTERNAL_THERMISTOR);
+    }
+    void set_ionizer_switch_obj(CustomSwitch* sw) {
+        switch_ionizer_ = sw;
+        sw->set_controller(this);
+        sw->set_type(SWITCH_IONIZER);
     }
 
     float get_setup_priority() const override {
@@ -815,10 +872,9 @@ public:
             this->publish_state();
         }
 
-        switch_ionizer_.set_icon("mdi:pine-tree");
-
-        switch_internal_thermistor_.set_icon("mdi:thermometer");
-        switch_internal_thermistor_.restore_and_set_mode(esphome::switch_::SWITCH_RESTORE_DEFAULT_OFF);
+        if (switch_internal_thermistor_) {
+            switch_internal_thermistor_->restore_and_set_mode(esphome::switch_::SWITCH_RESTORE_DEFAULT_OFF);
+        }
 
         ESP_LOGD(TAG, "setup before recv");
         while (serial_->available() > 0) {
@@ -856,8 +912,9 @@ public:
     // CLIMATE ENTITY CONTROL HANDLING
     ///////////////////////////////////////////
     void control_handle_mode(const climate::ClimateCall& call) {
-        this->mode = *call.get_mode();
-        if (this->mode == climate::CLIMATE_MODE_OFF) {
+        auto mode_val = *call.get_mode();
+        this->mode = mode_val;
+        if (mode_val == climate::CLIMATE_MODE_OFF) {
             this->request_write_register_(ToshibaCommand::POWER_STATE, ToshibaState::STATE_OFF);
             return;
         } else {
@@ -866,7 +923,7 @@ public:
             }
         }
 
-        switch (this->mode) {
+        switch (mode_val) {
             case climate::CLIMATE_MODE_COOL:
                 this->request_write_register_(ToshibaCommand::MODE, ToshibaMode::MODE_COOL);
                 break;
@@ -883,7 +940,7 @@ public:
                 this->request_write_register_(ToshibaCommand::MODE, ToshibaMode::MODE_HEAT_COOL);
                 break;
             default:
-                ESP_LOGE(TAG, "received unknown mode: %s", mode);
+                ESP_LOGE(TAG, "received unknown mode: %d", (int)mode_val);
                 break;
         }
     }
@@ -902,7 +959,7 @@ public:
             return;
         }
 
-        if (this->switch_internal_thermistor_.state) {
+        if (switch_internal_thermistor_ && switch_internal_thermistor_->state) {
             automatic_eight_degrees_switchover(this->target_temperature);
             this->internal_target_temperature_ = this->target_temperature;
             if (this->mode != climate::CLIMATE_MODE_HEAT) {
@@ -915,7 +972,7 @@ public:
             } else {
                 this->request_write_register_(ToshibaCommand::TARGET_TEMPERATURE, this->internal_target_temperature_);
             }
-            sensor_fcu_setpoint_temp_.publish_state(this->internal_target_temperature_);
+            if (sensor_fcu_setpoint_temp_) sensor_fcu_setpoint_temp_->publish_state(this->internal_target_temperature_);
         } else {
             ESP_LOGD(TAG,
                      "internal thermistor is disabled, idu target temperature is updated by smart_thermostat_control");
@@ -928,29 +985,30 @@ public:
             return;
         }
 
-        this->set_fan_mode_(*call.get_fan_mode());
+        auto fan_mode_val = *call.get_fan_mode();
+        this->set_fan_mode_(fan_mode_val);
 
-        if (this->fan_mode == climate::CLIMATE_FAN_AUTO) {
+        if (fan_mode_val == climate::CLIMATE_FAN_AUTO) {
             this->request_write_register_(ToshibaCommand::FAN_MODE, ToshibaFanMode::FAN_AUTO);
             return;
         }
-        if (this->fan_mode == climate::CLIMATE_FAN_QUIET) {
+        if (fan_mode_val == climate::CLIMATE_FAN_QUIET) {
             this->request_write_register_(ToshibaCommand::FAN_MODE, ToshibaFanMode::FAN_QUIET);
             return;
         }
-        if (this->fan_mode == climate::CLIMATE_FAN_LOW) {
+        if (fan_mode_val == climate::CLIMATE_FAN_LOW) {
             this->request_write_register_(ToshibaCommand::FAN_MODE, ToshibaFanMode::FAN_LOW);
             return;
         }
-        if (this->fan_mode == climate::CLIMATE_FAN_MEDIUM) {
+        if (fan_mode_val == climate::CLIMATE_FAN_MEDIUM) {
             this->request_write_register_(ToshibaCommand::FAN_MODE, ToshibaFanMode::FAN_MEDIUM);
             return;
         }
-        if (this->fan_mode == climate::CLIMATE_FAN_HIGH) {
+        if (fan_mode_val == climate::CLIMATE_FAN_HIGH) {
             this->request_write_register_(ToshibaCommand::FAN_MODE, ToshibaFanMode::FAN_HIGH);
             return;
         }
-        ESP_LOGE(TAG, "received unknown fan mode: %s", this->fan_mode);
+        ESP_LOGE(TAG, "received unknown fan mode: %d", (int)fan_mode_val);
     }
 
     void control_handle_custom_fan_mode(const climate::ClimateCall& call) {
@@ -959,17 +1017,18 @@ public:
             return;
         }
 
-        this->set_custom_fan_mode_(*call.get_custom_fan_mode());
+        auto cfm = call.get_custom_fan_mode();
+        this->set_custom_fan_mode_(cfm.c_str());
 
-        if (this->custom_fan_mode == CUSTOM_FAN_MODE_LOW_MEDIUM) {
+        if (cfm == CUSTOM_FAN_MODE_LOW_MEDIUM) {
             this->request_write_register_(ToshibaCommand::FAN_MODE, ToshibaFanMode::FAN_LOW_MEDIUM);
             return;
         }
-        if (this->custom_fan_mode == CUSTOM_FAN_MODE_MEDIUM_HIGH) {
+        if (cfm == CUSTOM_FAN_MODE_MEDIUM_HIGH) {
             this->request_write_register_(ToshibaCommand::FAN_MODE, ToshibaFanMode::FAN_MEDIUM_HIGH);
             return;
         }
-        ESP_LOGE(TAG, "received unknown custom fan mode: %s", this->custom_fan_mode);
+        ESP_LOGE(TAG, "received unknown custom fan mode: %s", cfm.c_str());
     }
 
     void control_handle_swing_mode(const climate::ClimateCall& call) {
@@ -978,35 +1037,36 @@ public:
             return;
         }
 
-        this->swing_mode = *call.get_swing_mode();
+        auto swing_mode_val = *call.get_swing_mode();
+        this->swing_mode = swing_mode_val;
 
-        if (this->swing_mode == climate::CLIMATE_SWING_OFF) {
+        if (swing_mode_val == climate::CLIMATE_SWING_OFF) {
             this->internal_swing_mode_ = ToshibaSwingMode::SWING_MODE_OFF;
             this->request_write_register_(ToshibaCommand::SWING_MODE, ToshibaSwingMode::SWING_MODE_OFF);
             return;
         }
-        if (this->swing_mode == climate::CLIMATE_SWING_VERTICAL) {
+        if (swing_mode_val == climate::CLIMATE_SWING_VERTICAL) {
             this->internal_swing_mode_ = ToshibaSwingMode::SWING_MODE_SWING_VERTICAL;
             this->request_write_register_(ToshibaCommand::SWING_MODE, ToshibaSwingMode::SWING_MODE_SWING_VERTICAL);
             return;
         }
-        if (this->swing_mode == climate::CLIMATE_SWING_HORIZONTAL) {
+        if (swing_mode_val == climate::CLIMATE_SWING_HORIZONTAL) {
             this->internal_swing_mode_ = ToshibaSwingMode::SWING_MODE_SWING_HORIZONTAL;
             this->request_write_register_(ToshibaCommand::SWING_MODE, ToshibaSwingMode::SWING_MODE_SWING_HORIZONTAL);
             return;
         }
-        if (this->swing_mode == climate::CLIMATE_SWING_BOTH) {
+        if (swing_mode_val == climate::CLIMATE_SWING_BOTH) {
             this->internal_swing_mode_ = ToshibaSwingMode::SWING_MODE_SWING_VERTICAL_AND_HORIZONTAL;
             this->request_write_register_(ToshibaCommand::SWING_MODE,
                                           ToshibaSwingMode::SWING_MODE_SWING_VERTICAL_AND_HORIZONTAL);
             return;
         }
-        ESP_LOGE(TAG, "received unknown swing mode: %s", this->swing_mode);
+        ESP_LOGE(TAG, "received unknown swing mode: %d", (int)swing_mode_val);
     }
 
     // Process changes from HA.
     void control(const climate::ClimateCall& call) override {
-        ESP_LOGE(TAG, "climate entity control() called");
+        ESP_LOGD(TAG, "climate entity control() called");
 
         if (!is_initialized_) {
             ESP_LOGE(TAG, "not initialized yet, ignoring control command");
@@ -1022,10 +1082,7 @@ public:
         if (call.get_fan_mode().has_value()) {
             this->control_handle_fan_mode(call);
         }
-        if (call.get_custom_fan_mode().has_value()) {
-            this->control_handle_custom_fan_mode(call);
-        }
-        if (call.get_custom_fan_mode().has_value()) {
+        if (!call.get_custom_fan_mode().empty()) {
             this->control_handle_custom_fan_mode(call);
         }
         if (call.get_swing_mode().has_value()) {
@@ -1116,6 +1173,7 @@ public:
     }
 
     void set_special_mode_select(int mode) {
+        if (updating_from_ac_) return;
         if (!is_initialized_) {
             ESP_LOGE(TAG, "not initialized yet, ignoring special mode select command");
             return;
@@ -1123,6 +1181,7 @@ public:
 
         ToshibaSpecialModes old_special_mode = this->internal_special_mode_;
 
+        // Options: Standard(0), High Power(1), ECO(2), 8 Degrees(3), Sleep Care(4), Floor(5), Comfort(6)
         switch (mode) {
             case 0:
                 this->internal_special_mode_ = ToshibaSpecialModes::SPECIAL_MODE_STANDARD;
@@ -1137,30 +1196,24 @@ public:
                 this->internal_special_mode_ = ToshibaSpecialModes::SPECIAL_MODE_EIGHT_DEGREES;
                 break;
             case 4:
-                this->internal_special_mode_ = ToshibaSpecialModes::SPECIAL_MODE_FIREPLACE_1;
-                break;
-            case 5:
-                this->internal_special_mode_ = ToshibaSpecialModes::SPECIAL_MODE_FIREPLACE_2;
-                break;
-            case 6:
-                this->internal_special_mode_ = ToshibaSpecialModes::SPECIAL_MODE_SILENT_1;
-                break;
-            case 7:
-                this->internal_special_mode_ = ToshibaSpecialModes::SPECIAL_MODE_SILENT_2;
-                break;
-            case 8:
                 this->internal_special_mode_ = ToshibaSpecialModes::SPECIAL_MODE_SLEEP_CARE;
                 break;
-            case 9:
+            case 5:
                 this->internal_special_mode_ = ToshibaSpecialModes::SPECIAL_MODE_FLOOR;
                 break;
-            case 10:
+            case 6:
                 this->internal_special_mode_ = ToshibaSpecialModes::SPECIAL_MODE_COMFORT;
                 break;
             default:
                 ESP_LOGE(TAG, "Unexpected special mode: %d", mode);
                 return;
         }
+        // Reset silent and fireplace selects when a special mode is chosen
+        // Use flag to suppress on_value callbacks and prevent infinite recursion
+        updating_from_ac_ = true;
+        if (silent_mode_select_) silent_mode_select_->publish_state("Off");
+        if (fireplace_select_) fireplace_select_->publish_state("Off");
+        updating_from_ac_ = false;
 
         if (this->mode != climate::CLIMATE_MODE_HEAT &&
             this->internal_special_mode_ == ToshibaSpecialModes::SPECIAL_MODE_EIGHT_DEGREES) {
@@ -1175,9 +1228,9 @@ public:
             if (this->internal_target_temperature_ < 17) {
                 this->internal_target_temperature_ = 17;
                 this->request_write_register_(ToshibaCommand::TARGET_TEMPERATURE, this->internal_target_temperature_);
-                sensor_fcu_setpoint_temp_.publish_state(this->internal_target_temperature_);
+                if (sensor_fcu_setpoint_temp_) sensor_fcu_setpoint_temp_->publish_state(this->internal_target_temperature_);
 
-                if (switch_internal_thermistor_.state) {
+                if (switch_internal_thermistor_ && switch_internal_thermistor_->state) {
                     this->target_temperature = this->internal_target_temperature_;
                     this->publish_state();
                 }
@@ -1191,9 +1244,9 @@ public:
                 this->internal_target_temperature_ = 16;
                 this->request_write_register_(ToshibaCommand::TARGET_TEMPERATURE,
                                               this->internal_target_temperature_ + 16);
-                sensor_fcu_setpoint_temp_.publish_state(this->internal_target_temperature_);
+                if (sensor_fcu_setpoint_temp_) sensor_fcu_setpoint_temp_->publish_state(this->internal_target_temperature_);
 
-                if (switch_internal_thermistor_.state) {
+                if (switch_internal_thermistor_ && switch_internal_thermistor_->state) {
                     this->target_temperature = this->internal_target_temperature_;
                     this->publish_state();
                 }
@@ -1203,29 +1256,88 @@ public:
         this->request_write_register_(ToshibaCommand::SPECIAL_MODE, this->internal_special_mode_);
     }
 
-    ///////////////////////////////////////////
-    // SENSOR ENTITIES
-    ///////////////////////////////////////////
-    std::vector<sensor::Sensor*> get_sensors() {
-        return {
-            &sensor_outdoor_temperature_, &sensor_fcu_air_temp_, &sensor_fcu_setpoint_temp_, &sensor_fcu_tc_temp_,
-            &sensor_fcu_tcj_temp_,        &sensor_fcu_fan_rpm_,  &sensor_cdu_td_temp_,       &sensor_cdu_ts_temp_,
-            &sensor_cdu_te_temp_,         &sensor_cdu_load_,     &sensor_cdu_iac_,
-        };
+    void set_silent_mode_select(int mode) {
+        if (updating_from_ac_) return;
+        // Options: Off(0), Silent 1(1), Silent 2(2)
+        if (!is_initialized_) {
+            ESP_LOGE(TAG, "not initialized yet, ignoring silent mode select command");
+            return;
+        }
+        ToshibaSpecialModes old_special_mode = this->internal_special_mode_;
+        switch (mode) {
+            case 1: this->internal_special_mode_ = ToshibaSpecialModes::SPECIAL_MODE_SILENT_1; break;
+            case 2: this->internal_special_mode_ = ToshibaSpecialModes::SPECIAL_MODE_SILENT_2; break;
+            default: this->internal_special_mode_ = ToshibaSpecialModes::SPECIAL_MODE_STANDARD; break;
+        }
+        // Reset special mode and fireplace selects
+        // Use flag to suppress on_value callbacks and prevent infinite recursion
+        updating_from_ac_ = true;
+        this->special_mode_select_->publish_state("Standard");
+        if (fireplace_select_) fireplace_select_->publish_state("Off");
+        updating_from_ac_ = false;
+        // Handle 8 degrees exit if needed
+        if (old_special_mode == ToshibaSpecialModes::SPECIAL_MODE_EIGHT_DEGREES &&
+            this->internal_target_temperature_ < 17) {
+            this->internal_target_temperature_ = 17;
+            this->request_write_register_(ToshibaCommand::TARGET_TEMPERATURE, this->internal_target_temperature_);
+            if (sensor_fcu_setpoint_temp_) sensor_fcu_setpoint_temp_->publish_state(this->internal_target_temperature_);
+        }
+        this->request_write_register_(ToshibaCommand::SPECIAL_MODE, this->internal_special_mode_);
     }
+
+    void set_fireplace_select(int mode) {
+        if (updating_from_ac_) return;
+        // Options: Off(0), Fireplace 1(1), Fireplace 2(2)
+        if (!is_initialized_) {
+            ESP_LOGE(TAG, "not initialized yet, ignoring fireplace select command");
+            return;
+        }
+        ToshibaSpecialModes old_special_mode = this->internal_special_mode_;
+        switch (mode) {
+            case 1: this->internal_special_mode_ = ToshibaSpecialModes::SPECIAL_MODE_FIREPLACE_1; break;
+            case 2: this->internal_special_mode_ = ToshibaSpecialModes::SPECIAL_MODE_FIREPLACE_2; break;
+            default: this->internal_special_mode_ = ToshibaSpecialModes::SPECIAL_MODE_STANDARD; break;
+        }
+        // Reset special mode and silent selects
+        // Use flag to suppress on_value callbacks and prevent infinite recursion
+        updating_from_ac_ = true;
+        this->special_mode_select_->publish_state("Standard");
+        if (silent_mode_select_) silent_mode_select_->publish_state("Off");
+        updating_from_ac_ = false;
+        // Handle 8 degrees exit if needed
+        if (old_special_mode == ToshibaSpecialModes::SPECIAL_MODE_EIGHT_DEGREES &&
+            this->internal_target_temperature_ < 17) {
+            this->internal_target_temperature_ = 17;
+            this->request_write_register_(ToshibaCommand::TARGET_TEMPERATURE, this->internal_target_temperature_);
+            if (sensor_fcu_setpoint_temp_) sensor_fcu_setpoint_temp_->publish_state(this->internal_target_temperature_);
+        }
+        this->request_write_register_(ToshibaCommand::SPECIAL_MODE, this->internal_special_mode_);
+    }
+
+    void set_silent_mode_select_ptr(select::Select* s) { silent_mode_select_ = s; }
+    void set_fireplace_select_ptr(select::Select* s) { fireplace_select_ = s; }
+
+    ///////////////////////////////////////////
+    // SENSOR SETTERS (called from climate.py codegen)
+    ///////////////////////////////////////////
+    void set_outdoor_temperature_sensor(sensor::Sensor* s) { sensor_outdoor_temperature_ = s; }
+    void set_fcu_air_temp_sensor(sensor::Sensor* s) { sensor_fcu_air_temp_ = s; }
+    void set_fcu_setpoint_sensor(sensor::Sensor* s) { sensor_fcu_setpoint_temp_ = s; }
+    void set_fcu_tc_temp_sensor(sensor::Sensor* s) { sensor_fcu_tc_temp_ = s; }
+    void set_fcu_tcj_temp_sensor(sensor::Sensor* s) { sensor_fcu_tcj_temp_ = s; }
+    void set_fcu_fan_rpm_sensor(sensor::Sensor* s) { sensor_fcu_fan_rpm_ = s; }
+    void set_cdu_td_temp_sensor(sensor::Sensor* s) { sensor_cdu_td_temp_ = s; }
+    void set_cdu_ts_temp_sensor(sensor::Sensor* s) { sensor_cdu_ts_temp_ = s; }
+    void set_cdu_te_temp_sensor(sensor::Sensor* s) { sensor_cdu_te_temp_ = s; }
+    void set_cdu_load_sensor(sensor::Sensor* s) { sensor_cdu_load_ = s; }
+    void set_cdu_iac_sensor(sensor::Sensor* s) { sensor_cdu_iac_ = s; }
 
     ///////////////////////////////////////////
     // SWITCHES
     ///////////////////////////////////////////
-    std::vector<switch_::Switch*> get_switches() {
-        return {
-            &switch_internal_thermistor_,
-            &switch_ionizer_,
-        };
-    }
-
     void set_internal_thermistor_switch(bool state) {
         ESP_LOGD(TAG, "set_internal_thermistor_switch %d", state);
+        if (switch_internal_thermistor_) switch_internal_thermistor_->publish_state(state);
     }
 
     void set_ionizer_switch(bool state) {
@@ -1239,6 +1351,22 @@ public:
             this->request_write_register_(ToshibaCommand::IONIZER, ToshibaIonizer::IONIZER_ON);
         } else {
             this->request_write_register_(ToshibaCommand::IONIZER, ToshibaIonizer::IONIZER_OFF);
+        }
+    }
+
+    void set_wifi_led_switch(bool state) {
+        ESP_LOGD(TAG, "set_wifi_led_switch %d", state);
+        if (!is_initialized_) {
+            ESP_LOGE(TAG, "not initialized yet, ignoring wifi led command");
+            return;
+        }
+        // Write to both variants — the AC accepts the correct one, ignores the other
+        if (state) {
+            this->request_write_register_(ToshibaCommand::WIFILED1, 0x05);
+            this->request_write_register_(ToshibaCommand::WIFILED2, 0x00);
+        } else {
+            this->request_write_register_(ToshibaCommand::WIFILED1, 0x00);
+            this->request_write_register_(ToshibaCommand::WIFILED2, 0x80);
         }
     }
 
@@ -1266,15 +1394,14 @@ private:
 
     std::deque<std::pair<double, long>> offset_history_;  // <error, time>
     long last_fcu_fan_off_millis_ = 0;
-    double temperature_boost_mode = 0;
     int thermal_runaway_fix = 0;
-    uint8_t thermostat_rounding_mode = 0;
+    int8_t thermostat_rounding_mode = 0;
 
     void smart_thermostat_control() {
         if (!is_initialized_) {
             return;
         }
-        if (millis() - last_external_temperature_sensor_control_millis_ < 30000) {
+        if (millis() - last_external_temperature_sensor_control_millis_ < 10000) {
             return;
         }
 
@@ -1284,7 +1411,7 @@ private:
 
         last_external_temperature_sensor_control_millis_ = millis();
 
-        if (switch_internal_thermistor_.state) {
+        if (switch_internal_thermistor_ && switch_internal_thermistor_->state) {
             return;
         }
 
@@ -1295,6 +1422,11 @@ private:
         }
         if (std::isnan(room_temp) || room_temp == 0) {
             room_temp = internal_idu_room_temperature_;
+  if (temperature_sensor_ != nullptr && !std::isnan(temperature_sensor_->get_state())) {
+    ESP_LOGI(TAG, "[THERMOSTAT] Using external temperature sensor: %.2f", temperature_sensor_->get_state());
+  } else {
+    ESP_LOGI(TAG, "[THERMOSTAT] Using internal IDU room temperature: %d", internal_idu_room_temperature_);
+  }
         }
 
         if (room_temp < 0) {
@@ -1311,12 +1443,12 @@ private:
             return;
         }
 
-        if (sensor_fcu_fan_rpm_.get_state() <= 0) {
+        if (!sensor_fcu_fan_rpm_ || sensor_fcu_fan_rpm_->state <= 0) {
             last_fcu_fan_off_millis_ = millis();
         }
 
         // if the fan is running (for at least one minute), add the current offset to the offset history
-        if (sensor_fcu_fan_rpm_.get_state() > 0 && millis() - last_fcu_fan_off_millis_ > 60000) {
+        if (sensor_fcu_fan_rpm_ && sensor_fcu_fan_rpm_->state > 0 && millis() - last_fcu_fan_off_millis_ > 60000) {
             offset_history_.emplace_back((double)internal_idu_room_temperature_ - room_temp, millis());
         }
 
@@ -1342,7 +1474,12 @@ private:
             average_error /= offset_history_.size();
             size_t n = errors.size() / 2;
             std::nth_element(errors.begin(), errors.begin() + n, errors.end());
-            median_error = errors.size() % 2 == 0 ? (errors[n - 1] + errors[n]) / 2.0 : errors[n];
+            if (errors.size() % 2 == 0) {
+                std::nth_element(errors.begin(), errors.begin() + n - 1, errors.begin() + n);
+                median_error = (errors[n - 1] + errors[n]) / 2.0;
+            } else {
+                median_error = errors[n];
+            }
         }
 
         // calculate target_error and target_setpoint
@@ -1411,18 +1548,18 @@ private:
             } else {
                 this->request_write_register_(ToshibaCommand::TARGET_TEMPERATURE, this->internal_target_temperature_);
             }
-            sensor_fcu_setpoint_temp_.publish_state(this->internal_target_temperature_);
+            if (sensor_fcu_setpoint_temp_) sensor_fcu_setpoint_temp_->publish_state(this->internal_target_temperature_);
             ESP_LOGD(TAG,
                      "smart_thermostat: set internal_target_temperature_ for target %.2f (current: %.2f) to %d (raw: "
                      "%.2f) (fcuAirTemp: %.2f) with median_error %.2f (avg_error: %.2f) and thermal_runaway_fix %d",
                      this->target_temperature, room_temp, target_setpoint_int, target_setpoint,
-                     this->sensor_fcu_air_temp_.get_state(), median_error, average_error, thermal_runaway_fix);
+                     sensor_fcu_air_temp_ ? sensor_fcu_air_temp_->state : NAN, median_error, average_error, thermal_runaway_fix);
         } else {
             ESP_LOGD(TAG,
                      "smart_thermostat: set internal_target_temperature_ for target %.2f (current: %.2f) to %d (raw: "
                      "%.2f) (fcuAirTemp: %.2f) with median_error %.2f (avg_error: %.2f) and thermal_runaway_fix %d [no change]",
                      this->target_temperature, room_temp, target_setpoint_int, target_setpoint,
-                     this->sensor_fcu_air_temp_.get_state(), median_error, average_error, thermal_runaway_fix);
+                     sensor_fcu_air_temp_ ? sensor_fcu_air_temp_->state : NAN, median_error, average_error, thermal_runaway_fix);
         }
 
         this->current_temperature = room_temp;
@@ -1442,11 +1579,11 @@ private:
                                      // disabled
 
         if (is_initialized_ && millis() > 30000 && millis()-last_external_temperature_sensor_control_millis_ > 2500) { // wait for 2.5s after we potentially wrote to the target temperature / special mode registers
-            if (millis() - last_partial_register_request_millis_ > 10000) {
+            if (millis() - last_partial_register_request_millis_ > 5000) {
                 ESP_LOGD(TAG, "requesting partial registers");
                 last_partial_register_request_millis_ = millis();
                 request_registers_(false);
-            } else if (millis() - last_full_register_request_millis_ > 150000) {
+            } else if (millis() - last_full_register_request_millis_ > 60000) {
                 ESP_LOGD(TAG, "requesting full registers");
                 last_full_register_request_millis_ = millis();
                 request_registers_(true);
@@ -1455,8 +1592,18 @@ private:
     }
 };
 
-void CustomSwitch::write_state(bool state) {
+inline void CustomSwitch::write_state(bool state) {
     publish_state(state);
+    if (controller_) {
+        switch (type_) {
+            case SWITCH_INTERNAL_THERMISTOR:
+                controller_->set_internal_thermistor_switch(state);
+                break;
+            case SWITCH_IONIZER:
+                controller_->set_ionizer_switch(state);
+                break;
+        }
+    }
 }
 
 }  // namespace esphome
