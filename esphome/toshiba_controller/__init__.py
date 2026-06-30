@@ -12,7 +12,7 @@ CODEOWNERS = []
 DEPENDENCIES = ["uart"]
 AUTO_LOAD = ["climate", "sensor", "switch", "select"]
 
-toshiba_controller_ns = cg.get_esphome_ns()
+toshiba_controller_ns = cg.esphome_ns
 ToshibaController = toshiba_controller_ns.class_(
     "ToshibaController", climate.Climate, cg.Component
 )
