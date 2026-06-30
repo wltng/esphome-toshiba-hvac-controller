@@ -62,6 +62,23 @@ SENSOR_KEYS = {
             accuracy_decimals=0,
         ),
     },
+    "power_watt": {
+        "setter": "set_power_watt_sensor",
+        "schema": sensor.sensor_schema(
+            unit_of_measurement="W",
+            icon="mdi:lightning-bolt",
+            device_class="power",
+            state_class=STATE_CLASS_MEASUREMENT,
+            accuracy_decimals=0,
+        ),
+    },
+    "self_cleaning": {
+        "setter": "set_self_cleaning_sensor",
+        "schema": sensor.sensor_schema(
+            icon="mdi:vacuum",
+            accuracy_decimals=0,
+        ),
+    },
 }
 
 CONFIG_SCHEMA = cv.Schema(

@@ -86,6 +86,7 @@ enum ToshibaCommand {
     SPECIAL_MODE = 0xF7,
     IDU_STATUS = 0xE4,
     ODU_STATUS = 0xE5,
+    POWER_WATT = 0xEE,  // realtime power in Watt, little-endian 16-bit
 };
 
 enum ToshibaSpecialModes {
@@ -155,6 +156,7 @@ class ToshibaController final : public climate::Climate, public Component {
     esphome::uart::UARTComponent* serial_{nullptr};
     esphome::sensor::Sensor* temperature_sensor_{nullptr};
     esphome::select::Select* swing_mode_select_{nullptr};
+    esphome::select::Select* fixed_position_select_{nullptr};
     esphome::select::Select* special_mode_select_{nullptr};
     esphome::select::Select* silent_mode_select_{nullptr};
     esphome::select::Select* fireplace_select_{nullptr};
@@ -163,6 +165,11 @@ class ToshibaController final : public climate::Climate, public Component {
     uint32_t last_partial_register_request_millis_ = 0;
     uint32_t last_full_register_request_millis_ = 0;
     uint32_t last_external_temperature_sensor_control_millis_ = 0;
+    uint32_t last_special_mode_write_millis_ = 0;  // grace period: ignore read responses shortly after writing SPECIAL_MODE
+    uint32_t last_power_off_command_millis_ = 0;   // grace period: detect self-cleaning after power off
+    bool self_cleaning_active_ = false;            // true when AC is in self-cleaning after power off
+    uint8_t pending_eight_degrees_count_ = 0;  // debounce: require 2 consecutive EIGHT_DEGREES readings
+    bool boot_mode_reset_done_ = false;        // one-time reset of transient modes (silent/fireplace) after boot
 
     CustomSwitch* switch_internal_thermistor_{nullptr};
     CustomSwitch* switch_ionizer_{nullptr};
@@ -200,6 +207,8 @@ class ToshibaController final : public climate::Climate, public Component {
     sensor::Sensor* sensor_fcu_tc_temp_{nullptr};
     sensor::Sensor* sensor_fcu_tcj_temp_{nullptr};
     sensor::Sensor* sensor_fcu_fan_rpm_{nullptr};
+    sensor::Sensor* sensor_self_cleaning_{nullptr};
+    sensor::Sensor* sensor_power_watt_{nullptr};
 
     uint64_t loop_cnt_ = 0;
 
@@ -329,7 +338,22 @@ class ToshibaController final : public climate::Climate, public Component {
     void handle_register_power_state(ToshibaState value) {
         switch (value) {
             case ToshibaState::STATE_ON:
+                // Self-cleaning detection: if we recently sent OFF and the AC reports ON back,
+                // it's the self-cleaning cycle (fan dries the evaporator).
+                // Grace period: 120 seconds after power-off command.
+                if (this->internal_power_state_ == ToshibaState::STATE_OFF &&
+                    millis() - last_power_off_command_millis_ < 120000 &&
+                    last_power_off_command_millis_ > 0) {
+                    ESP_LOGI(TAG, "[REGISTER] received power ON %d ms after power-off command — self-cleaning detected, suppressing",
+                             millis() - last_power_off_command_millis_);
+                    self_cleaning_active_ = true;
+                    if (sensor_self_cleaning_) sensor_self_cleaning_->publish_state(true);
+                    // Keep HA in OFF state — don't update internal state
+                    return;
+                }
                 ESP_LOGI(TAG, "[REGISTER] received power state: %s", "ON");
+                self_cleaning_active_ = false;
+                if (sensor_self_cleaning_) sensor_self_cleaning_->publish_state(false);
                 if (this->internal_power_state_ == ToshibaState::STATE_OFF) {
                     request_read_register_(ToshibaCommand::MODE);
                     request_read_register_(ToshibaCommand::TARGET_TEMPERATURE);
@@ -337,6 +361,13 @@ class ToshibaController final : public climate::Climate, public Component {
                 break;
             case ToshibaState::STATE_OFF:
                 ESP_LOGI(TAG, "[REGISTER] received power state: %s", "OFF");
+                if (self_cleaning_active_) {
+                    ESP_LOGI(TAG, "[REGISTER] self-cleaning cycle completed");
+                    self_cleaning_active_ = false;
+                    if (sensor_self_cleaning_) sensor_self_cleaning_->publish_state(false);
+                }
+                // Record timestamp for self-cleaning detection (also when OFF via IR remote)
+                last_power_off_command_millis_ = millis();
                 this->mode = climate::CLIMATE_MODE_OFF;
                 this->publish_state();
                 break;
@@ -387,6 +418,8 @@ class ToshibaController final : public climate::Climate, public Component {
     }
 
     void handle_register_swing_mode(ToshibaSwingMode value) {
+        bool is_fixed = false;
+
         switch (value) {
             case ToshibaSwingMode::SWING_MODE_OFF:
                 ESP_LOGI(TAG, "[REGISTER] received swing mode: %s", "OFF");
@@ -407,32 +440,97 @@ class ToshibaController final : public climate::Climate, public Component {
             case ToshibaSwingMode::SWING_MODE_FIXED_1:
                 ESP_LOGI(TAG, "[REGISTER] received swing mode: %s", "FIXED_1");
                 this->swing_mode = climate::CLIMATE_SWING_OFF;
+                is_fixed = true;
                 break;
             case ToshibaSwingMode::SWING_MODE_FIXED_2:
                 ESP_LOGI(TAG, "[REGISTER] received swing mode: %s", "FIXED_2");
                 this->swing_mode = climate::CLIMATE_SWING_OFF;
+                is_fixed = true;
                 break;
             case ToshibaSwingMode::SWING_MODE_FIXED_3:
                 ESP_LOGI(TAG, "[REGISTER] received swing mode: %s", "FIXED_3");
                 this->swing_mode = climate::CLIMATE_SWING_OFF;
+                is_fixed = true;
                 break;
             case ToshibaSwingMode::SWING_MODE_FIXED_4:
                 ESP_LOGI(TAG, "[REGISTER] received swing mode: %s", "FIXED_4");
                 this->swing_mode = climate::CLIMATE_SWING_OFF;
+                is_fixed = true;
                 break;
             case ToshibaSwingMode::SWING_MODE_FIXED_5:
                 ESP_LOGI(TAG, "[REGISTER] received swing mode: %s", "FIXED_5");
                 this->swing_mode = climate::CLIMATE_SWING_OFF;
+                is_fixed = true;
                 break;
             default:
                 ESP_LOGE(TAG, "[REGISTER] received unknown swing mode: %s", format_hex_pretty((uint8_t)value).c_str());
                 break;
         }
+
+        // Sync the select entities to match the AC state
+        updating_from_ac_ = true;
+        if (is_fixed) {
+            // Fixed position active → swing select to Off, fixed select to the position
+            if (swing_mode_select_) swing_mode_select_->publish_state("Off");
+            if (fixed_position_select_ != nullptr) {
+                int pos = (uint8_t)value - (uint8_t)ToshibaSwingMode::SWING_MODE_FIXED_1 + 1;
+                static const char* fixed_names[] = {"Off", "Fixed 1", "Fixed 2", "Fixed 3", "Fixed 4", "Fixed 5"};
+                if (pos >= 1 && pos <= 5) {
+                    fixed_position_select_->publish_state(fixed_names[pos]);
+                }
+            }
+        } else {
+            // Swing or Off active → fixed select to Off
+            if (fixed_position_select_ != nullptr) {
+                fixed_position_select_->publish_state("Off");
+            }
+            // Sync swing select based on actual swing mode
+            if (swing_mode_select_) {
+                switch (value) {
+                    case ToshibaSwingMode::SWING_MODE_OFF:
+                        swing_mode_select_->publish_state("Off");
+                        break;
+                    case ToshibaSwingMode::SWING_MODE_SWING_VERTICAL:
+                        swing_mode_select_->publish_state("Vertical");
+                        break;
+                    case ToshibaSwingMode::SWING_MODE_SWING_HORIZONTAL:
+                        swing_mode_select_->publish_state("Horizontal");
+                        break;
+                    case ToshibaSwingMode::SWING_MODE_SWING_VERTICAL_AND_HORIZONTAL:
+                        swing_mode_select_->publish_state("Vertical & Horizontal");
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+        updating_from_ac_ = false;
+
         this->publish_state();
         this->internal_swing_mode_ = value;
     }
 
     void handle_register_special_mode(ToshibaSpecialModes value) {
+        // Grace period after write: ignore stale read responses that report the old value
+        // before the AC has processed the write (race condition with 5s polling).
+        if (millis() - last_special_mode_write_millis_ < 2000) {
+            ESP_LOGI(TAG, "[REGISTER] ignoring special mode read 0x%02X during write grace period (%d ms ago)",
+                     (uint8_t)value, millis() - last_special_mode_write_millis_);
+            return;
+        }
+
+        // After a reboot: reset transient modes (silent/fireplace) once to Standard.
+        // These modes are managed by automations and must not persist across a reboot.
+        if (!boot_mode_reset_done_) {
+            boot_mode_reset_done_ = true;
+            if (value == SPECIAL_MODE_SILENT_1 || value == SPECIAL_MODE_SILENT_2 ||
+                value == SPECIAL_MODE_FIREPLACE_1 || value == SPECIAL_MODE_FIREPLACE_2) {
+                ESP_LOGI(TAG, "[INIT] Boot-reset: transient mode 0x%02X → STANDARD", (uint8_t)value);
+                request_write_register_(ToshibaCommand::SPECIAL_MODE, SPECIAL_MODE_STANDARD);
+                value = SPECIAL_MODE_STANDARD;  // process as if we received STANDARD
+            }
+        }
+
         updating_from_ac_ = true;
         // Reset all selects to their neutral value first, then set the active one
         bool is_silent = (value == ToshibaSpecialModes::SPECIAL_MODE_SILENT_1 ||
@@ -460,6 +558,15 @@ class ToshibaController final : public climate::Climate, public Component {
                 break;
             case ToshibaSpecialModes::SPECIAL_MODE_EIGHT_DEGREES:
                 ESP_LOGI(TAG, "[REGISTER] received special mode: %s", "EIGHT_DEGREES");
+                // Debounce: spurious EIGHT_DEGREES readings occur during reconnect handshake.
+                // Require 2 consecutive confirmations before accepting the transition.
+                // set_special_mode_select (user command) bypasses this and updates directly.
+                if (++pending_eight_degrees_count_ < 2) {
+                    ESP_LOGW(TAG, "[REGISTER] EIGHT_DEGREES not confirmed yet (count=%d), deferring state update",
+                             pending_eight_degrees_count_);
+                    updating_from_ac_ = false;
+                    return;
+                }
                 this->special_mode_select_->publish_state("8 Degrees");
                 break;
             case ToshibaSpecialModes::SPECIAL_MODE_SLEEP_CARE:
@@ -498,6 +605,9 @@ class ToshibaController final : public climate::Climate, public Component {
                 ESP_LOGE(TAG, "[REGISTER] received unknown special mode: %s",
                          format_hex_pretty((uint8_t)value).c_str());
                 break;
+        }
+        if (value != ToshibaSpecialModes::SPECIAL_MODE_EIGHT_DEGREES) {
+            pending_eight_degrees_count_ = 0;
         }
         this->internal_special_mode_ = value;
         updating_from_ac_ = false;
@@ -775,14 +885,12 @@ class ToshibaController final : public climate::Climate, public Component {
 
         supported_traits_.set_supported_custom_fan_modes({CUSTOM_FAN_MODE_LOW_MEDIUM, CUSTOM_FAN_MODE_MEDIUM_HIGH});
 
-        supported_traits_.set_supports_current_temperature(true);
-        supported_traits_.set_supports_two_point_target_temperature(false);
-        supported_traits_.set_supports_action(false);
+        supported_traits_.add_feature_flags(climate::CLIMATE_SUPPORTS_CURRENT_TEMPERATURE);
         supported_traits_.set_visual_min_temperature(
             (int)std::min(MIN_TEMP_SETPOINT_HEATING, MIN_TEMP_SETPOINT_COOLING));
         supported_traits_.set_visual_max_temperature(MAX_TEMP_SETPOINT);
         supported_traits_.set_visual_current_temperature_step(0.1);
-        supported_traits_.set_visual_target_temperature_step(0.5);
+        supported_traits_.set_visual_target_temperature_step(1.0);
     }
 
     void automatic_eight_degrees_switchover(uint8_t target_temperature) {
@@ -832,6 +940,7 @@ public:
     void set_temperature_sensor(esphome::sensor::Sensor* sensor) { temperature_sensor_ = sensor; }
     void set_special_mode_select(esphome::select::Select* sel) { special_mode_select_ = sel; }
     void set_swing_mode_select(esphome::select::Select* sel) { swing_mode_select_ = sel; }
+    void set_fixed_position_select_ptr(esphome::select::Select* sel) { fixed_position_select_ = sel; }
     void set_power_select(esphome::select::Select* sel) { power_selection_select_ = sel; }
     void set_smart_thermostat_multiplier(float val) { config_settings_.smart_thermostat_multiplier = val; }
     void set_disable_cooling_modes(bool val) {
@@ -917,6 +1026,7 @@ public:
         if (mode_val == climate::CLIMATE_MODE_OFF) {
             this->request_write_register_(ToshibaCommand::POWER_STATE, ToshibaState::STATE_OFF);
             this->internal_power_state_ = ToshibaState::STATE_OFF;
+            this->last_power_off_command_millis_ = millis();
             return;
         } else {
             if (internal_power_state_ == ToshibaState::STATE_OFF) {
@@ -1122,12 +1232,13 @@ public:
     }
 
     void set_swing_mode_select(int mode) {
+        if (updating_from_ac_) return;
         if (!is_initialized_) {
             ESP_LOGE(TAG, "not initialized yet, ignoring swing mode select command");
             return;
         }
 
-        // implement the index function as switch
+        // Options: Off(0), Vertical(1), Horizontal(2), Vertical & Horizontal(3)
         switch (mode) {
             case 0:
                 this->internal_swing_mode_ = ToshibaSwingMode::SWING_MODE_OFF;
@@ -1145,30 +1256,57 @@ public:
                 this->internal_swing_mode_ = ToshibaSwingMode::SWING_MODE_SWING_VERTICAL_AND_HORIZONTAL;
                 this->swing_mode = climate::CLIMATE_SWING_BOTH;
                 break;
-            case 4:
-                this->internal_swing_mode_ = ToshibaSwingMode::SWING_MODE_FIXED_1;
-                this->swing_mode = climate::CLIMATE_SWING_OFF;
-                break;
-            case 5:
-                this->internal_swing_mode_ = ToshibaSwingMode::SWING_MODE_FIXED_2;
-                this->swing_mode = climate::CLIMATE_SWING_OFF;
-                break;
-            case 6:
-                this->internal_swing_mode_ = ToshibaSwingMode::SWING_MODE_FIXED_3;
-                this->swing_mode = climate::CLIMATE_SWING_OFF;
-                break;
-            case 7:
-                this->internal_swing_mode_ = ToshibaSwingMode::SWING_MODE_FIXED_4;
-                this->swing_mode = climate::CLIMATE_SWING_OFF;
-                break;
-            case 8:
-                this->internal_swing_mode_ = ToshibaSwingMode::SWING_MODE_FIXED_5;
-                this->swing_mode = climate::CLIMATE_SWING_OFF;
-                break;
             default:
                 ESP_LOGE(TAG, "Unexpected swing mode: %d", mode);
                 return;
         }
+
+        // Swing activated → reset fixed position to Off
+        if (mode > 0 && fixed_position_select_ != nullptr) {
+            updating_from_ac_ = true;
+            fixed_position_select_->publish_state("Off");
+            updating_from_ac_ = false;
+        }
+
+        this->request_write_register_(ToshibaCommand::SWING_MODE, this->internal_swing_mode_);
+        this->publish_state();
+    }
+
+    void set_fixed_position_select(int position) {
+        if (updating_from_ac_) return;
+        if (!is_initialized_) {
+            ESP_LOGE(TAG, "not initialized yet, ignoring fixed position select command");
+            return;
+        }
+
+        // Options: Off(0), Position 1(1), Position 2(2), Position 3(3), Position 4(4), Position 5(5)
+        switch (position) {
+            case 0:
+                // Off selected: if swing is also Off, send Off to AC
+                if (this->internal_swing_mode_ >= ToshibaSwingMode::SWING_MODE_FIXED_1 &&
+                    this->internal_swing_mode_ <= ToshibaSwingMode::SWING_MODE_FIXED_5) {
+                    this->internal_swing_mode_ = ToshibaSwingMode::SWING_MODE_OFF;
+                    this->swing_mode = climate::CLIMATE_SWING_OFF;
+                    this->request_write_register_(ToshibaCommand::SWING_MODE, this->internal_swing_mode_);
+                    this->publish_state();
+                }
+                return;
+            case 1: this->internal_swing_mode_ = ToshibaSwingMode::SWING_MODE_FIXED_1; break;
+            case 2: this->internal_swing_mode_ = ToshibaSwingMode::SWING_MODE_FIXED_2; break;
+            case 3: this->internal_swing_mode_ = ToshibaSwingMode::SWING_MODE_FIXED_3; break;
+            case 4: this->internal_swing_mode_ = ToshibaSwingMode::SWING_MODE_FIXED_4; break;
+            case 5: this->internal_swing_mode_ = ToshibaSwingMode::SWING_MODE_FIXED_5; break;
+            default:
+                ESP_LOGE(TAG, "Unexpected fixed position: %d", position);
+                return;
+        }
+
+        this->swing_mode = climate::CLIMATE_SWING_OFF;
+
+        // Fixed position activated → reset swing select to Off
+        updating_from_ac_ = true;
+        if (swing_mode_select_) swing_mode_select_->publish_state("Off");
+        updating_from_ac_ = false;
 
         this->request_write_register_(ToshibaCommand::SWING_MODE, this->internal_swing_mode_);
         this->publish_state();
@@ -1320,7 +1458,7 @@ public:
     void set_fireplace_select_ptr(select::Select* s) { fireplace_select_ = s; }
 
     ///////////////////////////////////////////
-    // SENSOR SETTERS (called from climate.py codegen)
+    // SENSOR SETTERS (called from __init__.py codegen)
     ///////////////////////////////////////////
     void set_outdoor_temperature_sensor(sensor::Sensor* s) { sensor_outdoor_temperature_ = s; }
     void set_fcu_air_temp_sensor(sensor::Sensor* s) { sensor_fcu_air_temp_ = s; }
@@ -1333,6 +1471,8 @@ public:
     void set_cdu_te_temp_sensor(sensor::Sensor* s) { sensor_cdu_te_temp_ = s; }
     void set_cdu_load_sensor(sensor::Sensor* s) { sensor_cdu_load_ = s; }
     void set_cdu_iac_sensor(sensor::Sensor* s) { sensor_cdu_iac_ = s; }
+    void set_self_cleaning_sensor(sensor::Sensor* s) { sensor_self_cleaning_ = s; }
+    void set_power_watt_sensor(sensor::Sensor* s) { sensor_power_watt_ = s; }
 
     ///////////////////////////////////////////
     // SWITCHES

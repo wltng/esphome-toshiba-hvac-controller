@@ -68,6 +68,7 @@ toshiba_controller:
   temperature_sensor_id: temperature_sensor
   special_mode_select_id: special_mode
   swing_mode_select_id: swing_mode
+  fixed_position_select_id: fixed_position  # remove if your unit doesn't support fixed positions
   power_select_id: power_select
   smart_thermostat_multiplier: ${smart_thermostat_multiplier}
   smart_thermostat_runaway_protection: ${smart_thermostat_runaway_protection}
@@ -104,6 +105,10 @@ sensor:
       name: CDU Load
     cdu_iac:
       name: CDU IAC
+    power_watt:
+      name: Power
+    self_cleaning:
+      name: Self Cleaning
 
 select:
   - platform: template
@@ -163,6 +168,19 @@ select:
       - "Vertical"
       - "Horizontal"
       - "Vertical & Horizontal"
+    on_value:
+      - lambda: |-
+          static_cast<esphome::ToshibaController*>(id(${deviceid}))->set_swing_mode_select(i);
+
+  # Optional: fixed vane positions (comment out for units that only support vertical swing)
+  - platform: template
+    name: Fixed Position
+    id: fixed_position
+    optimistic: true
+    restore_value: true
+    icon: mdi:arrow-collapse-vertical
+    options:
+      - "Off"
       - "Fixed 1"
       - "Fixed 2"
       - "Fixed 3"
@@ -170,7 +188,7 @@ select:
       - "Fixed 5"
     on_value:
       - lambda: |-
-          static_cast<esphome::ToshibaController*>(id(${deviceid}))->set_swing_mode_select(i);
+          static_cast<esphome::ToshibaController*>(id(${deviceid}))->set_fixed_position_select(i);
 
   - platform: template
     name: Power Select

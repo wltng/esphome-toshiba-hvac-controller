@@ -1,4 +1,8 @@
 # ESPHome Toshiba / Carrier HVAC Controller over UART / WIFI Interface
+
+> **This fork is compatible with ESPHome 2026.x** (tested on 2026.3.1).
+> See [Changes compared to the original](#changes-compared-to-the-original) below.
+
 This repository contains both the hardware (kicad & production files) for an ESP32 module as well as an [ESPHome](https://esphome.io/) component to control Toshiba / Carrier RAS HVAC units independently from the Toshiba Cloud.
 
 ESP8266 is also supported but requires custom wiring.
@@ -14,6 +18,42 @@ Features of the component:
 * Support for power modes on single split units and ionizer toggle
 * Additional information like fan speeds, compressor load, refrigerant / pipe temperatures
 * WiFi LED toggle (on/off via UART registers 0xDE/0xDF)
+
+## Changes compared to the original
+
+This fork is based on [florianbrede-ayet/esphome-toshiba-hvac-controller](https://github.com/florianbrede-ayet/esphome-toshiba-hvac-controller) with the following changes:
+
+**Bugfixes**
+- `internal_power_state_` is now updated immediately when sending a power command, instead of waiting for AC confirmation. This fixes a race condition where quickly switching the AC off and back on could result in the AC staying off (the ON command was silently dropped because the state had not yet been confirmed).
+
+**ESPHome 2026 compatibility**
+- Traits API: reverted upstream's `set_supports_current_temperature()` / `set_supports_action()` back to `add_feature_flags()`, which is the correct modern API as of ESPHome 2025.11.0 (the `set_supports_*` methods are deprecated).
+- Target temperature step kept at `1.0` — the Toshiba UART protocol only supports integer setpoints (`uint8_t`), so 0.5° steps would display in HA but silently truncate to whole degrees.
+
+**Extended `__init__.py`**
+- Optional `silent_mode_select_id` — wire up a silent mode select entity
+- Optional `fireplace_select_id` — wire up a fireplace mode select entity
+- Optional `fixed_position_select_id` — wire up a fixed vane position select (separate from swing mode, like the native Toshiba app)
+- Optional sensor outputs: `outdoor_temperature`, `fcu_air_temp`, `fcu_setpoint`, `fcu_tc_temp`, `fcu_tcj_temp`, `fcu_fan_rpm`, `cdu_td_temp`, `cdu_ts_temp`, `cdu_te_temp`, `cdu_load`, `cdu_iac`, `power_watt`, `self_cleaning`
+
+**Swing / Fixed Position split**
+- The swing mode selector now only contains Off, Vertical, Horizontal, and Vertical & Horizontal
+- Fixed vane positions (Fixed 1–5) are in a separate optional selector, matching the native Toshiba app
+- Both selectors mutually exclude each other: selecting a swing mode resets fixed to Off and vice versa
+- Units that only support vertical swing (e.g. some ceiling models) can omit the fixed position selector
+
+**Self-cleaning detection**
+- After turning off the AC (via HA or IR remote), the unit may enter a self-cleaning cycle (fan dries the evaporator)
+- Previously, the AC reported `POWER_STATE=ON` during this cycle, incorrectly showing the AC as "on" in HA
+- Now: if the AC reports ON within 120 seconds of a power-off, it is recognized as self-cleaning and HA stays OFF
+- A `self_cleaning` sensor (0/1) indicates when the self-cleaning cycle is active
+
+**Special mode race condition fix**
+- 2-second grace period after writing `SPECIAL_MODE` register — stale read responses are ignored
+- One-time boot reset of transient modes (silent/fireplace) to Standard after ESP reboot
+
+**Realtime power sensor**
+- `power_watt` sensor reads register `0xEE` for realtime power consumption in Watts (16-bit little-endian)
 
 Missing functionality:
 * Manual defrost (probably unsupported over UART WIFI interface)
