@@ -314,7 +314,7 @@ class ToshibaController final : public climate::Climate, public Component {
         }
 
         if (millis()-this->last_partial_register_request_millis_>=2500) {
-            ESP_LOGE(TAG, "received target temperature %d after %d ms - possibly out of sync, skipping update", value, millis()-this->last_partial_register_request_millis_);
+            ESP_LOGE(TAG, "received target temperature %d after %ul ms - possibly out of sync, skipping update", value, millis()-this->last_partial_register_request_millis_);
             return;
         }
         
@@ -829,7 +829,7 @@ void handle_register_power_selection(ToshibaPowerSelection value) {
         }
 
         if (recv_buf_len_ > 0 && millis() - last_recv_millis_ >= 100) {
-            ESP_LOGE(TAG, "discarded %d rx bytes due to timeout", recv_buf_len_);
+            ESP_LOGE(TAG, "discarded %ul rx bytes due to timeout", recv_buf_len_);
             recv_buf_len_ = 0;
         }
     }
